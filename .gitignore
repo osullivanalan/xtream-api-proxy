@@ -28,6 +28,7 @@ htmlcov/
 # Environment variables
 .env
 .env.local
+config.json
 
 # OS files
 .DS_Store
