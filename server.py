@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 import filters
 
 # --- LOGGING SETUP ---
-# We force the logger to flush immediately for better real-time debugging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -21,7 +20,16 @@ logger = logging.getLogger("xtream-proxy")
 app = FastAPI()
 
 CACHE_FILE = "local_cache.json"
-# Global variable to track status
+
+# --- GLOBAL IN-MEMORY CACHE ---
+# We keep data in memory to avoid reading disk on every request
+IN_MEMORY_CACHE = None
+# We build a fast lookup index {id: item} for VOD and Series
+SEARCH_INDEX = {
+    "vod": {},
+    "series": {}
+}
+
 JOB_STATUS = {"state": "IDLE", "message": "Ready", "last_run": None}
 
 def load_config():
@@ -46,11 +54,37 @@ def get_xtream_url(action: str):
     pwd = config["xtream"]["password"]
     return f"{base}/player_api.php?username={user}&password={pwd}&action={action}"
 
-def load_cache():
+# --- OPTIMIZED CACHE LOADING ---
+def load_cache_to_memory():
+    """Loads JSON from disk into global variables and builds search indexes."""
+    global IN_MEMORY_CACHE, SEARCH_INDEX
     if not os.path.exists(CACHE_FILE):
-        return None
-    with open(CACHE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        logger.info("No cache file found on disk.")
+        return
+
+    try:
+        logger.info("Loading cache from disk into memory...")
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            IN_MEMORY_CACHE = data
+            
+            # Build Fast Lookup Index for VOD
+            # stream_id might be string or int in JSON, we index by int for safety
+            vods = data.get("data", {}).get("vod", [])
+            SEARCH_INDEX["vod"] = {int(v.get("stream_id")): v for v in vods if v.get("stream_id")}
+            
+            # Build Fast Lookup Index for Series
+            series = data.get("data", {}).get("series", [])
+            SEARCH_INDEX["series"] = {int(s.get("series_id")): s for s in series if s.get("series_id")}
+            
+            logger.info(f"Cache loaded. Indexed {len(SEARCH_INDEX['vod'])} VODs and {len(SEARCH_INDEX['series'])} Series.")
+    except Exception as e:
+        logger.error(f"Failed to load cache: {e}")
+
+# Load cache on startup
+@app.on_event("startup")
+async def startup_event():
+    load_cache_to_memory()
 
 # -----------------------------------------------------------------------------
 # BACKGROUND WORKER
@@ -62,37 +96,38 @@ async def perform_refresh():
     
     tasks = {
         "live": ("get_live_streams", "get_live_categories"),
-        "vod":  ("get_vod_streams", "get_vod_categories"),
+        "vod": ("get_vod_streams", "get_vod_categories"),
         "series": ("get_series", "get_series_categories")
     }
+
     final_data = {}
     final_categories = {}
-    
+
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client: # Increased timeout
+        async with httpx.AsyncClient(timeout=300.0) as client:
             for key, (stream_action, cat_action) in tasks.items():
                 logger.info(f"Downloading {key}...")
                 JOB_STATUS["message"] = f"Downloading {key}..."
-                
+
                 # 1. Categories
                 cat_resp = await client.get(get_xtream_url(cat_action))
-                # Run CPU-heavy JSON parsing in a thread to prevent blocking
                 raw_cats = await asyncio.to_thread(json.loads, cat_resp.content.decode('utf-8', errors='replace'))
                 cat_map = {c['category_id']: c for c in raw_cats}
-                
+
                 # 2. Streams
                 stream_resp = await client.get(get_xtream_url(stream_action))
                 raw_streams = await asyncio.to_thread(json.loads, stream_resp.content.decode('utf-8', errors='replace'))
-                
+
                 # 3. Filtering
                 logger.info(f"Filtering {key}...")
                 JOB_STATUS["message"] = f"Filtering {key}..."
                 
+                # Enrich streams with category names BEFORE filtering
                 for stream in raw_streams:
                     c_id = stream.get("category_id")
                     if c_id in cat_map:
                         stream["category_name"] = cat_map[c_id].get("category_name", "")
-                    
+
                 filtered_streams = filters.apply_filters(raw_streams, key)
                 final_data[key] = filtered_streams
                 
@@ -102,15 +137,20 @@ async def perform_refresh():
         # Save to Disk
         JOB_STATUS["message"] = "Saving to disk..."
         final_cache = {
-            "meta": { "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S") },
+            "meta": {
+                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            },
             "data": final_data,
             "categories": final_categories
         }
-        
+
         await asyncio.to_thread(
             lambda: json.dump(final_cache, open(CACHE_FILE, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
         )
         
+        # RELOAD MEMORY
+        load_cache_to_memory()
+
         logger.info("Refresh complete!")
         JOB_STATUS["state"] = "IDLE"
         JOB_STATUS["message"] = "Last run successful"
@@ -124,6 +164,115 @@ async def perform_refresh():
 # -----------------------------------------------------------------------------
 # ENDPOINTS
 # -----------------------------------------------------------------------------
+
+@app.get("/player_api.php")
+async def player_api(request: Request, username: str = None, password: str = None, action: Optional[str] = None, vod_id: Optional[int] = None, series_id: Optional[int] = None):
+    # --- AUTH CHECK ---
+    config = load_config()
+    if username != config["xtream"]["username"] or password != config["xtream"]["password"]:
+        return JSONResponse(content={"user_info": {"auth": 0}}, status_code=401)
+
+    # --- LOGIN RESPONSE ---
+    if not action:
+        host = request.url.hostname if request.url.hostname else "localhost"
+        port = str(request.url.port) if request.url.port else "8000"
+        return {
+            "user_info": {
+                "username": username,
+                "password": password,
+                "message": "Logged In",
+                "auth": 1,
+                "status": "Active",
+                "exp_date": "1999999999",
+                "created_at": "1600000000",
+                "max_connections": "10",
+                "allowed_output_formats": ["m3u8", "ts", "rtmp"]
+            },
+            "server_info": {
+                "url": f"http://{host}",
+                "port": port,
+                "https_port": port,
+                "server_protocol": "http",
+                "rtmp_port": "8000",
+                "timezone": "Europe/London",
+                "timestamp_now": int(datetime.now().timestamp()),
+                "time_now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "process": 1
+            }
+        }
+
+    # --- USE IN-MEMORY CACHE ---
+    # If cache isn't loaded yet, try loading it
+    if IN_MEMORY_CACHE is None:
+        load_cache_to_memory()
+    
+    if IN_MEMORY_CACHE is None:
+         return JSONResponse(content={"error": "Cache not built"}, status_code=503)
+
+    data = IN_MEMORY_CACHE.get("data", {})
+    categories = IN_MEMORY_CACHE.get("categories", {})
+
+    # --- OPTIMIZED ACTIONS ---
+
+    if action == "get_vod_info" and vod_id is not None:
+        # INSTANT LOOKUP (O(1)) instead of loop (O(N))
+        basic = SEARCH_INDEX["vod"].get(vod_id)
+        
+        # We still fetch upstream for extended metadata (Cast, Director, Plot)
+        # But now we don't block the Pi CPU searching for the basic info
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                upstream = await client.get(get_xtream_url(f"get_vod_info&vod_id={vod_id}"))
+                full_info = upstream.json()
+            except Exception:
+                # If upstream fails, at least return basic info if we have it
+                full_info = {"info": {}, "movie_data": {}}
+
+        if basic:
+            full_info.setdefault("movie_data", {})
+            # Merge basic info if upstream missing it
+            for k, v in basic.items():
+                if k not in full_info["movie_data"] or not full_info["movie_data"][k]:
+                     full_info["movie_data"][k] = v
+            
+        return JSONResponse(full_info, media_type="application/json; charset=utf-8")
+
+    elif action == "get_series_info" and series_id is not None:
+        # INSTANT LOOKUP (O(1))
+        basic = SEARCH_INDEX["series"].get(series_id)
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                upstream = await client.get(get_xtream_url(f"get_series_info&series_id={series_id}"))
+                full_info = upstream.json()
+            except Exception:
+                full_info = {"info": {}, "episodes": {}}
+
+        if basic:
+            full_info.setdefault("info", {})
+            # Merge basic info
+            for k, v in basic.items():
+                if k not in full_info["info"] or not full_info["info"][k]:
+                     full_info["info"][k] = v
+
+        return JSONResponse(full_info, media_type="application/json; charset=utf-8")
+
+    elif action == "get_live_streams":
+        return JSONResponse(data.get("live", []), media_type="application/json; charset=utf-8")
+    elif action == "get_live_categories":
+        return JSONResponse(categories.get("live", []), media_type="application/json; charset=utf-8")
+    elif action == "get_vod_streams":
+        return JSONResponse(data.get("vod", []), media_type="application/json; charset=utf-8")
+    elif action == "get_vod_categories":
+        return JSONResponse(categories.get("vod", []), media_type="application/json; charset=utf-8")
+    elif action == "get_series":
+        return JSONResponse(data.get("series", []), media_type="application/json; charset=utf-8")
+    elif action == "get_series_categories":
+        return JSONResponse(categories.get("series", []), media_type="application/json; charset=utf-8")
+
+    return JSONResponse([])
+
+
 
 @app.get("/refresh_cache")
 async def refresh_cache_endpoint(background_tasks: BackgroundTasks):
@@ -270,54 +419,6 @@ async def redirect_series(username: str, password: str, stream_id: str, ext: str
     real_url = f"{get_base_xtream_url()}/series/{username}/{password}/{stream_id}.{ext}"
     return RedirectResponse(real_url)
 
-@app.get("/player_api.php")
-async def player_api(request: Request, username: str = None, password: str = None, action: Optional[str] = None, vod_id: Optional[int] = None, series_id: Optional[int] = None):   # ... (Paste the robust player_api code from the previous turn) ...
-    config = load_config()
-    if username != config["xtream"]["username"] or password != config["xtream"]["password"]:
-        return JSONResponse(content={"user_info": {"auth": 0}}, status_code=401)
-    if not action:
-        host = request.url.hostname if request.url.hostname else "localhost"
-        port = str(request.url.port) if request.url.port else "8000"
-        return {
-            "user_info": {"username": username, "password": password, "message": "Logged In", "auth": 1, "status": "Active", "exp_date": "1999999999", "created_at": "1600000000", "max_connections": "10", "allowed_output_formats": ["m3u8", "ts", "rtmp"]},
-            "server_info": {"url": f"http://{host}", "port": port, "https_port": port, "server_protocol": "http", "rtmp_port": "8000", "timezone": "Europe/London", "timestamp_now": int(datetime.now().timestamp()), "time_now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "process": 1}
-        }
-    cache = load_cache()
-    if not cache: return JSONResponse(content={"error": "Cache not built"}, status_code=503)
-    data = cache.get("data", {})
-    categories = cache.get("categories", {})
-
-    # NEW: VOD info proxy
-    if action == "get_vod_info" and vod_id is not None:
-        # try to find in cached VOD list for quick basic info
-        vod_list = data.get("vod", [])
-        basic = next((v for v in vod_list if int(v.get("stream_id", -1)) == vod_id), None)
-        # always fetch full metadata from upstream (title, description, backdrops, etc.)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            upstream = await client.get(get_xtream_url(f"get_vod_info&vod_id={vod_id}"))
-            full_info = upstream.json()
-        if basic:
-            full_info.setdefault("basic_info", basic)
-        return JSONResponse(full_info, media_type="application/json; charset=utf-8")
-
-    # NEW: Series info proxy
-    elif action == "get_series_info" and series_id is not None:
-        series_list = data.get("series", [])
-        basic = next((s for s in series_list if int(s.get("series_id", -1)) == series_id), None)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            upstream = await client.get(get_xtream_url(f"get_series_info&series_id={series_id}"))
-            full_info = upstream.json()
-        if basic:
-            full_info.setdefault("basic_info", basic)
-        return JSONResponse(full_info, media_type="application/json; charset=utf-8")
-    
-    elif action == "get_live_streams": return JSONResponse(data.get("live", []), media_type="application/json; charset=utf-8")
-    elif action == "get_live_categories": return JSONResponse(categories.get("live", []), media_type="application/json; charset=utf-8")
-    elif action == "get_vod_streams": return JSONResponse(data.get("vod", []), media_type="application/json; charset=utf-8")
-    elif action == "get_vod_categories": return JSONResponse(categories.get("vod", []), media_type="application/json; charset=utf-8")
-    elif action == "get_series": return JSONResponse(data.get("series", []), media_type="application/json; charset=utf-8")
-    elif action == "get_series_categories": return JSONResponse(categories.get("series", []), media_type="application/json; charset=utf-8")
-    return []
 
 if __name__ == "__main__":
     import uvicorn
