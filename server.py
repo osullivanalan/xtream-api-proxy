@@ -6,7 +6,8 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, Form, HTTPException, Request, BackgroundTasks
-from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, FileResponse
+from pathlib import Path
 import filters
 
 # --- LOGGING SETUP ---
@@ -53,6 +54,19 @@ def get_xtream_url(action: str):
     user = config["xtream"]["username"]
     pwd = config["xtream"]["password"]
     return f"{base}/player_api.php?username={user}&password={pwd}&action={action}"
+
+
+# Add this function near your other helper functions (after load_config)
+def sanitize_stream_icons(streams, sanitize_enabled=True):
+    """Replace all icon URLs with placeholder if sanitization is enabled."""
+    if not sanitize_enabled:
+        return streams
+    
+    for stream in streams:
+        if "stream_icon" in stream:
+            stream["stream_icon"] = "https://placehold.co/320x180/1f2833/eee?text=No+Icon"
+    return streams
+
 
 # --- OPTIMIZED CACHE LOADING ---
 def load_cache_to_memory():
@@ -102,6 +116,10 @@ async def perform_refresh():
 
     final_data = {}
     final_categories = {}
+    
+    # Get sanitization setting
+    config = load_config()
+    sanitize_enabled = config.get("sanitize_icons", False)
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
@@ -129,6 +147,10 @@ async def perform_refresh():
                         stream["category_name"] = cat_map[c_id].get("category_name", "")
 
                 filtered_streams = filters.apply_filters(raw_streams, key)
+                
+                # 4. SANITIZE ICONS IF ENABLED
+                filtered_streams = sanitize_stream_icons(filtered_streams, sanitize_enabled)
+                
                 final_data[key] = filtered_streams
                 
                 kept_cat_ids = set(s.get("category_id") for s in filtered_streams)
@@ -161,9 +183,188 @@ async def perform_refresh():
         JOB_STATUS["state"] = "ERROR"
         JOB_STATUS["message"] = str(e)
 
+def generate_m3u_playlist(username: str, password: str, host: str, port: str) -> str:
+    """Generate M3U playlist from cached data."""
+    if IN_MEMORY_CACHE is None:
+        return "#EXTM3U\n# Cache not loaded\n"
+    
+    data = IN_MEMORY_CACHE.get("data", {})
+    base_url = f"http://{host}:{port}"
+    
+    # Get sanitization setting (applied during M3U generation)
+    config = load_config()
+    sanitize_enabled = config.get("sanitize_icons", False)
+    
+    lines = ["#EXTM3U"]
+    
+    # Live TV Streams
+    for stream in data.get("live", []):
+        stream_id = stream.get("stream_id")
+        name = stream.get("name", "Unknown")
+        logo = stream.get("stream_icon", "")
+        category = stream.get("category_name", "")
+        
+        # Apply sanitization to logo URL if needed
+        if sanitize_enabled and logo:
+            logo = f"http://{host}:{port}/icon/no-icon.svg"
+        
+        extinf = f'#EXTINF:-1 tvg-id="{stream_id}" tvg-name="{name}" tvg-logo="{logo}" group-title="{category}",{name}'
+        url = f"{base_url}/live/{username}/{password}/{stream_id}.ts"
+        
+        lines.append(extinf)
+        lines.append(url)
+    
+    # VOD Movies
+    for stream in data.get("vod", []):
+        stream_id = stream.get("stream_id")
+        name = stream.get("name", "Unknown")
+        logo = stream.get("stream_icon", "")
+        category = stream.get("category_name", "")
+        container = stream.get("container_extension", "mp4")
+        
+        if sanitize_enabled and logo:
+            logo = f"http://{host}:{port}/icon/no-icon.svg"
+        
+        extinf = f'#EXTINF:-1 tvg-id="{stream_id}" tvg-name="{name}" tvg-logo="{logo}" group-title="VOD - {category}",{name}'
+        url = f"{base_url}/movie/{username}/{password}/{stream_id}.{container}"
+        
+        lines.append(extinf)
+        lines.append(url)
+    
+    # Series
+ # Series in M3U - one entry per series (your original approach was right)
+    for series in data.get("series", []):
+        series_id = series.get("series_id")
+        name = series.get("name", "Unknown")
+        logo = series.get("cover", "")
+        category = series.get("category_name", "")
+        
+        if sanitize_enabled and logo:
+            logo = f"http://{host}:{port}/icon/no-icon.svg"
+        
+        # Key attributes for series recognition
+        extinf = (
+            f'#EXTINF:-1 '
+            f'tvg-id="{series_id}" '
+            f'tvg-name="{name}" '
+            f'tvg-logo="{logo}" '
+            f'group-title="Series - {category}" '
+            f'tvg-type="series",{name}'  # This helps players identify it as a series
+        )
+        # URL can be a placeholder or series info endpoint
+        url = f"{base_url}/series/{username}/{password}/{series_id}"
+        
+        lines.append(extinf)
+        lines.append(url)
+
+    
+    return "\n".join(lines)
+
+
 # -----------------------------------------------------------------------------
 # ENDPOINTS
 # -----------------------------------------------------------------------------
+@app.get("/icon/no-icon.svg")
+async def get_no_icon():
+    # Get the directory where this script is located
+    base_dir = Path(__file__).parent
+    file_path = base_dir / "icons/no-icon.svg"
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Icon not found")
+    
+    return FileResponse(
+        path=str(file_path),
+        media_type="image/svg+xml",
+        filename="no-icon.svg"
+    )
+
+
+@app.get("/playlist.m3u")
+async def get_m3u_playlist(request: Request, username: str = None, password: str = None):
+    """Serve M3U playlist file."""
+    config = load_config()
+    
+    # Use provided credentials or fall back to config
+    user = username or config["xtream"]["username"]
+    pwd = password or config["xtream"]["password"]
+    
+    # Verify auth if credentials provided
+    if username and password:
+        if username != config["xtream"]["username"] or password != config["xtream"]["password"]:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    host = request.url.hostname or "localhost"
+    port = str(request.url.port) if request.url.port else "8000"
+    
+    playlist_content = generate_m3u_playlist(user, pwd, host, port)
+    
+    return HTMLResponse(
+        content=playlist_content,
+        media_type="audio/x-mpegurl",
+        headers={
+            "Content-Disposition": f'attachment; filename="playlist.m3u"'
+        }
+    )
+
+@app.get("/playlist_url")
+async def get_playlist_url(request: Request):
+    """Return the M3U playlist URL for easy copying."""
+    config = load_config()
+    host = request.url.hostname or "localhost"
+    port = str(request.url.port) if request.url.port else "8000"
+    username = config["xtream"]["username"]
+    password = config["xtream"]["password"]
+    
+    playlist_url = f"http://{host}:{port}/playlist.m3u?username={username}&password={password}"
+    
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M3U Playlist URL</title>
+<style>
+  body {{ font-family: sans-serif; margin: 0; padding: 1rem; background:#0b0c10; color:#eee; }}
+  h1 {{ font-size: 1.4rem; margin-bottom: 1rem; }}
+  .card {{ background:#141923; padding:1rem; border-radius:6px; margin-top:0.75rem; }}
+  .url-box {{ background:#1f2833; padding:0.75rem; border-radius:4px; word-break:break-all; font-family:monospace; font-size:0.85rem; margin:0.75rem 0; }}
+  button {{ padding: 0.6rem 1rem; border-radius: 4px; border: none; background:#45a29e; color:#fff; font-weight: 600; width:100%; margin-top:0.5rem; }}
+  .note {{ font-size:0.8rem; color:#aaa; margin-top:0.75rem; }}
+  .success {{ color:#66fcf1; font-weight:600; margin-top:0.5rem; display:none; }}
+</style>
+</head>
+<body>
+  <h1>M3U Playlist URL</h1>
+  <div class="card">
+    <p>Copy this URL into Hypnotix or any M3U-compatible IPTV player:</p>
+    <div class="url-box" id="playlistUrl">{playlist_url}</div>
+    <button onclick="copyUrl()">Copy URL</button>
+    <div class="success" id="successMsg">✓ Copied to clipboard!</div>
+    <div class="note">
+      <b>Usage:</b><br>
+      • In Hypnotix: Providers → Add → Provider Type: "M3U URL" → Paste URL<br>
+      • The playlist includes all filtered Live TV, VOD, and Series from your cache
+    </div>
+  </div>
+  <div style="margin-top:1rem;">
+    <a href="/config" style="display:inline-block;padding:0.6rem 1rem;border-radius:4px;background:#1f2833;color:#eee;text-decoration:none;font-weight:600;">← Back to Config</a>
+  </div>
+  
+  <script>
+    function copyUrl() {{
+      const url = document.getElementById('playlistUrl').textContent;
+      navigator.clipboard.writeText(url).then(() => {{
+        const msg = document.getElementById('successMsg');
+        msg.style.display = 'block';
+        setTimeout(() => msg.style.display = 'none', 2000);
+      }});
+    }}
+  </script>
+</body>
+</html>
+    """)
+
 
 @app.get("/player_api.php")
 async def player_api(request: Request, username: str = None, password: str = None, action: Optional[str] = None, vod_id: Optional[int] = None, series_id: Optional[int] = None):
@@ -296,6 +497,7 @@ def get_status():
 @app.get("/config", response_class=HTMLResponse)
 def config_page():
     config = load_config()
+    sanitize_checked = "checked" if config.get("sanitize_icons", False) else ""
     return f"""
 <!DOCTYPE html>
 <html>
@@ -308,12 +510,14 @@ def config_page():
   form {{ display: flex; flex-direction: column; gap: 0.75rem; max-width: 480px; margin-top: 1rem; }}
   label {{ font-size: 0.9rem; }}
   input, textarea {{ width: 100%; padding: 0.5rem; border-radius: 4px; border: 1px solid #333; background:#1f2833; color:#eee; box-sizing: border-box; }}
+  input[type="checkbox"] {{ width: auto; margin-right: 0.5rem; }}
   button {{ padding: 0.6rem 1rem; border-radius: 4px; border: none; background:#45a29e; color:#fff; font-weight: 600; }}
   button:active {{ transform: scale(0.98); }}
   .row {{ display:flex; gap:0.5rem; }}
   .row > div {{ flex:1; }}
   .note {{ font-size:0.8rem; color:#aaa; }}
   .card {{ background:#141923; padding:1rem; border-radius:6px; margin-top:0.75rem; }}
+  .checkbox-row {{ display: flex; align-items: center; }}
 </style>
 </head>
 <body>
@@ -344,16 +548,25 @@ def config_page():
       <label>Series Filters (prefixes)</label>
       <input name="series_filters" value="{','.join(config['filters'].get('series', []))}" />
     </div>
+    <div class="card">
+      <div class="checkbox-row">
+        <input type="checkbox" name="sanitize_icons" id="sanitize_icons" {sanitize_checked} />
+        <label for="sanitize_icons">Replace all channel icons with placeholder (fixes broken icon URLs)</label>
+      </div>
+      <div class="note" style="margin-top:0.5rem;">Enable this if you're seeing DNS errors for icon-tmdb.me or slow loading times</div>
+    </div>
     <button type="submit">Save</button>
     <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
-  <a href="/refresh_cache" style="flex:1;padding:0.6rem;border-radius:4px;background:#66fcf1;color:#0b0c10;text-align:center;text-decoration:none;font-weight:600;">Refresh Cache</a>
-  <a href="/status" style="flex:1;padding:0.6rem;border-radius:4px;background:#1f2833;color:#eee;text-align:center;text-decoration:none;font-weight:600;">Status</a>
-</div>
-<div class="note" style="margin-top:0.75rem;">Tap <b>Refresh Cache</b> after saving to rebuild filtered lists.</div>
+      <a href="/refresh_cache" style="flex:1;padding:0.6rem;border-radius:4px;background:#66fcf1;color:#0b0c10;text-align:center;text-decoration:none;font-weight:600;">Refresh Cache</a>
+      <a href="/status" style="flex:1;padding:0.6rem;border-radius:4px;background:#1f2833;color:#eee;text-align:center;text-decoration:none;font-weight:600;">Status</a>
+      <a href="/playlist_url" style="flex:1;padding:0.6rem;border-radius:4px;background:#45a29e;color:#fff;text-align:center;text-decoration:none;font-weight:600;">M3U URL</a>
+    </div>
+    <div class="note" style="margin-top:0.75rem;">Tap <b>Refresh Cache</b> after saving to rebuild filtered lists.</div>
   </form>
 </body>
 </html>
     """
+
 
 @app.post("/update_config_form")
 def update_config_form(
@@ -363,6 +576,7 @@ def update_config_form(
     live_filters: str = Form(""),
     vod_filters: str = Form(""),
     series_filters: str = Form(""),
+    sanitize_icons: Optional[str] = Form(None),  # Checkboxes send None if unchecked
 ):
     config = load_config()
     config["xtream"]["base_url"] = base_url.strip()
@@ -371,9 +585,9 @@ def update_config_form(
     config["filters"]["live"] = [x.strip() for x in live_filters.split(",") if x.strip()]
     config["filters"]["vod"] = [x.strip() for x in vod_filters.split(",") if x.strip()]
     config["filters"]["series"] = [x.strip() for x in series_filters.split(",") if x.strip()]
+    config["sanitize_icons"] = sanitize_icons == "on"  # Checkbox value is "on" when checked
     save_config(config)
     logger.info("Configuration updated via UI form")
-    # Simple redirect back to the form
     return HTMLResponse(
         '<meta http-equiv="refresh" content="0;url=/config" />', status_code=200
     )
